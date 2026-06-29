@@ -1001,6 +1001,18 @@ class GraphExec : public amd::ReferenceCountedObject, public Graph {
       }
     }
     parallel_streams_.clear();
+    // Free capture-time PM4 templates (host-only) via the vdev that built them.
+    // Null-guarded so it is independent of develop's segment-scheduling guard.
+    if (pm4TemplateVdev_ != nullptr) {
+      for (auto& segKv : segmentBatches_) {
+        for (auto& batch : segKv.second.packet_batches) {
+          if (batch.pm4Template != nullptr) {
+            pm4TemplateVdev_->freePm4GraphTemplate(batch.pm4Template);
+            batch.pm4Template = nullptr;
+          }
+        }
+      }
+    }
     if (IsSegmentSchedulingEnabled()) {
       if (kernArgManager_ != nullptr) {
         kernArgManager_->release();
@@ -1038,6 +1050,10 @@ class GraphExec : public amd::ReferenceCountedObject, public Graph {
   hipError_t Run(hip::Stream* stream);
   // Capture GPU Packets from graph commands
   hipError_t CaptureAQLPackets();
+  // Encode each captured batch into a queue-independent PM4 template at instantiate
+  // so the first replay skips the CPU encode (specialize+upload only). Opt-in via
+  // the PM4 replay env gate; a no-op when the backend has no PM4 replay path.
+  void EncodePm4Templates();
   hipError_t UpdateAQLPacket(hip::GraphNode* node);
   // Handle packetBatches_ updates when nodes are enabled/disabled
   hipError_t UpdatePacketBatchesForNodeEnableDisable(hip::GraphNode* node, bool isEnabled);
@@ -1083,12 +1099,38 @@ class GraphExec : public amd::ReferenceCountedObject, public Graph {
     return parallel_streams_;
   }
 
+  //! RELIABLE version stamp for the current recorded packet set, used as the
+  //! PM4 replay IB cache key. It combines a value that is unique per GraphExec
+  //! instantiation (recordedPacketInstanceId_) with a counter that is bumped on
+  //! every packet mutation (recordedPacketMutationCount_), folded with the batch
+  //! index so each batch in a multi-batch graph gets a distinct nonzero value.
+  //! The rocm PM4 replay IB cache uses it to skip the per-launch content rehash
+  //! without losing correctness: any mutation changes the version, so a stale IB
+  //! can never be reused.
+  uint64_t RecordedPacketVersion(size_t batchIndex) const {
+    uint64_t t = (recordedPacketInstanceId_ * 1099511628211ull) ^
+                 (recordedPacketMutationCount_ * 0x9E3779B97F4A7C15ull) ^ (batchIndex + 1);
+    return t == 0 ? 1 : t;
+  }
+  //! Invalidate the recorded packet version (call on any packet mutation).
+  void InvalidateRecordedPacketVersion() { ++recordedPacketMutationCount_; }
+
  protected:
+  static uint64_t NextRecordedPacketInstanceId() {
+    static std::atomic<uint64_t> gen{0};
+    return ++gen;
+  }
+  //!< unique per GraphExec instantiation
+  uint64_t recordedPacketInstanceId_ = NextRecordedPacketInstanceId();
+  //!< bumped on any recorded-packet mutation
+  uint64_t recordedPacketMutationCount_ = 0;
   //! parallel streams per device
   std::unordered_map<int, std::vector<hip::Stream*>> parallel_streams_;
   uint64_t flags_ = 0;
   GraphKernelArgManager* kernArgManager_ = nullptr;  //!< Kernel Arg manager for graph.
   GraphSignalManager* signalManager_ = nullptr;      //!< HW event signal pool for graph launches.
+  //!< vdev that built the per-batch PM4 templates (used to free them at destroy).
+  device::VirtualDevice* pm4TemplateVdev_ = nullptr;
   bool hasHiddenHeap_ = false;  //!< Hidden heap indicator for Kernel node
   std::unordered_set<int> hiddenHeapInitializedDevices_;
   bool repeatLaunch_ = false;
@@ -1126,6 +1168,12 @@ class GraphExec : public amd::ReferenceCountedObject, public Graph {
     std::vector<NodeRange> nodeRanges;
     std::unordered_map<GraphNode*, size_t> nodeToRangeIndex;  // O(1) lookup
     int disabledNodeCount = 0;  // Count of currently disabled nodes
+    //! Opaque capture-time PM4 template (device::VirtualGPU::Pm4GraphTemplate*)
+    //! encoded from this batch's packets at instantiate, so the first replay only
+    //! specializes+uploads instead of running the full O(N) CPU encode. Owned here;
+    //! freed via pm4TemplateVdev_->freePm4GraphTemplate(). nullptr when the backend
+    //! has no PM4 replay path or the graph is not PM4-replayable.
+    void* pm4Template = nullptr;
     PacketBatch() {}
     // O(1) enable/disable operations - just update state
     void setEnabled(GraphNode* node, bool enabled);

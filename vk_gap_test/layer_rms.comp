@@ -1,0 +1,26 @@
+#version 450
+// LDS-reduction kernel, Vulkan counterpart of HIP/PM4 k_rms. ONE workgroup of 256
+// threads: shared-memory tree reduction (barrier) over the whole buffer, then a
+// bit-exact normalize. Intentionally NOT a real RMSNorm -- uses only a pure-add
+// reduction, a multiply by the exact power-of-two constant 2^-20, and the
+// 0.5*a+0.5*b blend (same shape as layer_revadd), so it matches HIP bit-for-bit.
+// Dispatch with groupCountX = 1. binding0 = X (input), binding1 = Y (output).
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly buffer X { float x[]; };
+layout(std430, binding = 1) buffer Y { float y[]; };
+layout(push_constant) uniform PC { uint n; } pc;
+shared float lds[256];
+void main() {
+    uint t = gl_LocalInvocationID.x;
+    uint n = pc.n;
+    float s = 0.0;
+    for (uint i = t; i < n; i += 256u) s += x[i];
+    lds[t] = s;
+    barrier();
+    for (uint o = 128u; o > 0u; o >>= 1u) {
+        if (t < o) lds[t] += lds[t + o];
+        barrier();
+    }
+    float mean = lds[0] * (1.0 / 1048576.0);  // 2^-20: exact in fp32
+    for (uint i = t; i < n; i += 256u) y[i] = 0.5 * x[i] + 0.5 * mean;
+}

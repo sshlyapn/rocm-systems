@@ -21,6 +21,12 @@
 #include <stack>
 #include <string>
 #include <thread>
+#include <atomic>
+#include <deque>
+#include <mutex>
+#include <unordered_map>
+#include <utility>
+#include <vector>
 
 namespace amd::roc {
 class Device;
@@ -629,24 +635,300 @@ class VirtualGPU : public device::VirtualDevice {
   bool dispatchAqlPacket(hsa_barrier_and_packet_t* packet, uint16_t header, uint16_t rest,
                          bool blocking = true, bool attach_signal = false);
 
-  //! Fast-path dispatch: pre-built flat contiguous buffer
+  //! Fast-path dispatch: pre-built flat contiguous buffer. recordedPacketVersion /
+  //! pm4Template carry the optional PM4-IB graph-replay fast path (see device.hpp).
   bool dispatchAqlPacketBatchFlat(const std::vector<uint8_t>& flatPacketData,
                                   const std::vector<uint32_t>& validFullHeaders,
                                   amd::AccumulateCommand* vcmd = nullptr,
                                   bool attach_signal = false,
                                   const std::vector<const std::string*>* kernelNames = nullptr,
                                   bool pre_patched = false,
-                                  bool blocking = false) override;
+                                  bool blocking = false,
+                                  uint64_t recordedPacketVersion = 0,
+                                  const void* pm4Template = nullptr) override;
 
   template <typename AqlPacket> bool dispatchGenericAqlPacket(AqlPacket* packet, uint16_t header,
                                                               uint16_t rest, bool blocking,
                                                               bool attach_signal = false,
                                                               bool cluster_launch = false);
+  //! Encode a captured graph into a heap-owned PM4 template (CPU-only, queue-
+  //! independent) for capture-time build. Returns an opaque Pm4GraphTemplate* or
+  //! nullptr if the graph is not PM4-replayable. Free with freePm4GraphTemplate.
+  void* buildPm4GraphTemplate(void* const* packets, size_t numPackets) override;
+  void freePm4GraphTemplate(void* tmpl) override;
 
   bool dispatchCounterAqlPacket(hsa_ext_amd_aql_pm4_packet_t* packet, const uint32_t gfxVersion,
                                 bool blocking, const hsa_ven_amd_aqlprofile_1_00_pfn_t* extApi);
   void dispatchBarrierPacket(uint16_t packetHeader, bool skipSignal = false,
                              hsa_signal_t signal = hsa_signal_t{0});
+
+  // EXPERIMENTAL (HIP_PWS_FENCE=1, gfx11 only): inter-kernel PWS deferred-wait
+  // fence. Replaces the firmware AQL packet-scope cache fence with an inline
+  // vendor PM4-IB packet (CS_PARTIAL_FLUSH + RELEASE_MEM(PWS) + ACQUIRE_MEM(PWS))
+  // so the cache flush overlaps the next dispatch instead of stalling the CP.
+  bool pwsFenceActive();         //!< env gate, cached
+  bool ensurePwsIb();            //!< lazily build the executable PWS PM4 IB
+  void injectPwsFence();         //!< append the vendor PM4-IB packet to the live queue
+  void capturePwsFence(uint8_t* dst);  //!< record the vendor PM4-IB packet into a graph slot
+
+  // EXPERIMENTAL (HIP_PM4_GRAPH=1, gfx11 only): replay a captured all-dispatch
+  // hipGraph as ONE PM4 indirect buffer (lean raw-PM4 dispatch front-end + in-place
+  // PWS fence between every dispatch) launched by a single vendor PM4-IB packet.
+  // This transfers the raw-PM4 PWS speedup into the HIP runtime: one CP jump for the
+  // whole graph (the IB-jump cost amortizes to ~0), unlike per-dispatch injection.
+  //!< Compiled PM4 IB for one captured graph. kDeferredScratch means the graph
+  //!< needs scratch the queue has not sized yet: replay via AQL (which sizes it),
+  //!< then rebuild on the next launch.
+  enum Pm4GraphStatus { kPm4Unbuilt, kPm4Ready, kPm4UnsupportedPermanent, kPm4DeferredScratch };
+  struct Pm4GraphIb {
+    void* ib = nullptr;
+    uint32_t dw = 0;
+    Pm4GraphStatus status = kPm4Unbuilt;
+    //! false when this cache entry only REFERENCES a GraphExec-owned shared IB
+    //! (device-scoped, built once across streams): freePm4GraphIb / eviction must
+    //! not release the storage in that case (the GraphExec owns it).
+    bool owned = true;
+    //! Per-kernel GPU-clock timestamp buffer (per-kernel profiling). CP-writable,
+    //! host-readable (CPU fine-grain pool). Holds tsCount 64-bit ticks at
+    //! kPm4TsStride byte stride. nullptr when profiling is not instrumented.
+    void* tsBuf = nullptr;
+    uint32_t tsCount = 0;
+  };
+  //!< Queue-runtime-dependent dword that a capture-time template leaves as a
+  //!< placeholder (written as 0) and that specializeFromTemplate() patches from
+  //!< the launch stream's queue. All are graph-constant (one value for the whole
+  //!< graph), so the encoder emits each exactly once under delta-encoding.
+  enum Pm4PlaceholderKind : uint8_t {
+    kPhScratchBaseLo, kPhScratchBaseHi,  //!< COMPUTE_USER_DATA scratch base >> 8
+    kPhTmpring,                          //!< COMPUTE_TMPRING_SIZE
+    kPhScratchVdesc0, kPhScratchVdesc1, kPhScratchVdesc2, kPhScratchVdesc3,  //!< scratch V#
+    kPhQueuePtrLo, kPhQueuePtrHi,        //!< amd_queue_t pointer (queue_ptr user SGPR)
+    kPhNone = 0xFF                       //!< not a placeholder (graph-fixed dword)
+  };
+  struct Pm4Placeholder { uint32_t offset; uint8_t kind; };
+  //!< A baked scalar dword that a scalar node-param mutation can change in place.
+  //!< Recorded at encode time (only when HIP_PM4_GRAPH_INPLACE is on, which forces
+  //!< delta-encoding off so every dispatch has its own patchable slot) so a mutated
+  //!< graph can patch the resident VRAM IB instead of rebuilding a new one. kind
+  //!< selects which AQL packet field supplies the new value; pkt is the dispatch
+  //!< index into the launch packet array.
+  enum Pm4MutKind : uint8_t {
+    kMutKernargLo, kMutKernargHi,        //!< kernarg_address user-SGPR words
+    kMutGridX, kMutGridY, kMutGridZ,     //!< DISPATCH_DIRECT grid dims
+    kMutWgX, kMutWgY, kMutWgZ            //!< COMPUTE_NUM_THREAD workgroup dims
+  };
+  struct Pm4MutField { uint32_t offset; uint8_t kind; uint16_t pkt; };
+  //!< CPU-only encode of a captured graph: the PM4 dwords with queue-dependent
+  //!< fields zeroed, plus the offsets of those fields. Produced at capture/
+  //!< instantiate (queue-independent) and specialized per launch stream. status
+  //!< is kPm4Ready (encodable) or kPm4UnsupportedPermanent; the scratch-not-yet-
+  //!< sized decision is deferred to specialize time (needsScratch).
+  struct Pm4GraphTemplate {
+    std::vector<uint32_t> dwords;
+    std::vector<Pm4Placeholder> patches;
+    Pm4GraphStatus status = kPm4Unbuilt;
+    bool needsScratch = false;
+    size_t numPackets = 0;
+    //! Content hash of the packet set this template was encoded from. A cache
+    //! miss specializes from the template only when it matches the launch packets
+    //! (pm4GraphKey), so a stale template (graph mutated -> different bytes) or a
+    //! disabled-node filtered subset is ignored and falls back to a full build.
+    uint64_t key = 0;
+    //! Content hash over STRUCTURAL fields only (numPackets, per-packet header|setup
+    //! and kernel_object), excluding the mutable scalars (kernarg, grid, workgroup).
+    //! Two packet sets with the same skeletonKey differ only by patchable scalars,
+    //! so the in-place fast path can patch the resident IB instead of rebuilding.
+    uint64_t skeletonKey = 0;
+    //! Offsets of the baked mutable scalar dwords (see Pm4MutField). Populated only
+    //! when HIP_PM4_GRAPH_INPLACE is on (which forces delta off so each dispatch has
+    //! its own slot); empty otherwise (in-place patching disabled for this template).
+    std::vector<Pm4MutField> mutFields;
+    //! GraphExec-owned, device-scoped specialized IB, built ONCE and shared by every
+    //! stream that replays this graph (each stream's cache just references it, never
+    //! re-specializes/uploads). Only populated when the template is queue-INDEPENDENT
+    //! (patches.empty(): no scratch, no queue_ptr), since otherwise the IB encodes
+    //! per-queue values. nullptr -> each stream specializes its own per-stream IB.
+    //! Owned here; freed (device pool) by freePm4GraphTemplate.
+    void* sharedIb = nullptr;
+    uint32_t sharedDw = 0;
+    //! Lazy shared-IB build. The device-scoped shared IB must be specialized and
+    //! uploaded on the EXECUTING vdev at first replay, NOT at instantiate on the
+    //! null-stream vdev: an IB whose bytes are SDMA-uploaded on one queue at
+    //! instantiate is not guaranteed visible to a DIFFERENT execution queue's CP
+    //! fetch later (no synchronization edge between the two), which silently
+    //! replays a stale/garbage IB. Building on the exec vdev gives the upload and
+    //! first CP fetch a queue ordering edge, exactly like the per-stream path.
+    //! wantSharedIb is set at instantiate; sharedReady guards the one-time build.
+    bool wantSharedIb = false;
+    std::atomic<bool> sharedReady{false};
+    std::mutex sharedMtx;
+    //! true when the specialized IB does not depend on any per-queue runtime value.
+    bool shareable() const { return status == kPm4Ready && patches.empty(); }
+    //! Per-kernel GPU-clock profiling (gated on LOG_INFO+LOG_AQL, decided at capture).
+    //! When set, the encoder appends a RELEASE_MEM(BOTTOM_OF_PIPE_TS, GPU-clock)
+    //! per kernel boundary; tsAddrOff holds the dword offset of each packet's
+    //! ADDRESS_LO so specializeFromTemplate can patch in a per-IB TS buffer.
+    bool instrumented = false;
+    std::vector<uint32_t> tsAddrOff;
+  };
+  std::unordered_map<uint64_t, Pm4GraphIb> pm4Graphs_;  //!< compiled IB cache, keyed by content hash
+  //! Insertion order of pm4Graphs_ keys, used to bound the VRAM held by compiled
+  //! IBs. A mutated graph re-captures to NEW packet content -> a NEW content hash
+  //! -> a NEW IB, leaving the pre-mutation IB unreferenced. Without a bound these
+  //! dead IBs would accumulate in the executable memory pool until the VirtualGPU
+  //! is destroyed. evictPm4GraphsIfNeeded() frees the oldest entries (never the
+  //! currently-armed one) once the cache exceeds kPm4MaxCachedIbs.
+  std::deque<uint64_t> pm4GraphKeyOrder_;
+  static constexpr size_t kPm4MaxCachedIbs = 16;
+  int pm4GraphState_ = -1;          //!< HIP_PM4_GRAPH env gate: -1 unknown, 0 off, 1 on
+  int pm4GraphScratchState_ = -1;   //!< HIP_PM4_GRAPH_SCRATCH env gate (scratch kernels)
+  int pm4GraphDeltaState_ = -1;     //!< HIP_PM4_GRAPH_DELTA env gate (register delta-encode)
+  int pm4GraphReorderState_ = -1;   //!< HIP_PM4_GRAPH_REORDER env gate (front-end reorder)
+  int pm4GraphKeyCacheState_ = -1;  //!< HIP_PM4_GRAPH_KEYCACHE env gate (skip per-launch rehash)
+  int pm4GraphPrewarmState_ = -1;   //!< HIP_PM4_GRAPH_PREWARM env gate (reserve exec IB arena at init)
+  int pm4GraphBuildAfterState_ = -1;//!< HIP_PM4_GRAPH_BUILD_AFTER env gate (AQL first, build IB after)
+  int pm4GraphSharedIbState_ = -1;  //!< HIP_PM4_GRAPH_SHARED_IB env gate (GraphExec-owned shared IB)
+  int pm4GraphInheritScopeState_ = -1;//!< per-edge fence from packet scope (default on; HIP_PM4_GRAPH_NO_INHERIT_SCOPE disables)
+  double pm4TsNsPerTick_ = 0.0;     //!< cached ns-per-tick for the agent-domain RELEASE_MEM GPU clock (0 = not queried)
+  //! Per-packet kernel names for the current PM4 graph launch (borrowed, not owned),
+  //! used only to label per-kernel timestamp logs; set at the launch site.
+  const std::vector<const std::string*>* pm4LaunchKernelNames_ = nullptr;
+  int pm4SdkProfilerState_ = -1;    //!< cached rocprofiler-sdk tool presence (dlsym rocprofiler_configure): -1 unknown, 0 absent, 1 attached
+  //! Byte stride between per-kernel timestamp slots. The RELEASE_MEM writes a 64-bit
+  //! GPU clock, so 8-byte slots (read back as a packed uint64_t array) is exact.
+  static constexpr uint32_t kPm4TsStride = 8;
+  // Last-lookup fast path: when the SAME recorded packet set is replayed back to
+  // back (the steady-state decode loop), skip recomputing the O(N) content hash.
+  // Validated by the graph-supplied recorded packet set version, which is nonzero,
+  // unique per GraphExec instantiation+batch, and bumped on ANY packet mutation
+  // (param update / enable-disable / re-capture) -- so this is a RELIABLE
+  // invalidation, not a heuristic. version 0 (non-graph caller) always takes the
+  // slow path. The cached pointer is into the node-based pm4Graphs_ map, so it
+  // stays valid across map inserts.
+  bool pm4IbCacheValid_ = false;
+  uint64_t pm4IbCacheVersion_ = 0;
+  Pm4GraphIb* pm4IbCacheEntry_ = nullptr;
+  //! Armed slot for the GraphExec-owned shared IB (#5). Holds a non-owning reference
+  //! to the device-scoped IB the current graph shares across streams. Kept OUT of
+  //! pm4Graphs_ (whose entries can outlive a freed GraphExec and alias a new graph by
+  //! content key); the keycache version stamp guards reuse, so a stale reference here
+  //! is never submitted (a new GraphExec has a new version -> re-arm before submit).
+  Pm4GraphIb pm4SharedRef_;
+  //! In-place double-buffered resident IB (HIP_PM4_GRAPH_INPLACE). For a graph that
+  //! is mutated only in scalar node params (kernarg pointer, grid/workgroup dims),
+  //! keep TWO resident device IBs (ping-pong) plus a persistent host staging buffer.
+  //! On a scalar mutation we patch the changed dwords into the IDLE slot and swap the
+  //! submit pointer -- no new device allocation, no full re-encode, no LRU churn. The
+  //! idle slot is guaranteed not in flight: before patching we wait on the completion
+  //! signal of its last submission (usually already complete -> no stall). A
+  //! structural mutation (skeleton change) tears this down and falls back to the
+  //! rebuild+cache path.
+  struct Pm4InplaceResident {
+    bool valid = false;
+    //! Identity tag only -- NEVER dereferenced after build (the owning GraphExec may
+    //! free the template on a different vdev). mutFields below is a private copy.
+    const Pm4GraphTemplate* tmpl = nullptr;
+    uint64_t skeletonKey = 0;                //!< structural identity of the resident IB
+    uint64_t version = 0;                    //!< recorded packet version in the active slot
+    void* slot[2] = {nullptr, nullptr};      //!< the two device-local exec IBs
+    uint32_t dw = 0;
+    uint32_t activeSlot = 0;
+    uint32_t spanLo = 0, spanHi = 0;         //!< contiguous dword span covering all mutFields
+    void* stage = nullptr;                   //!< fine-grain host staging (CPU+GPU), dw dwords
+    hsa_signal_t lastCompletion[2] = {{0}, {0}};  //!< last submit's completion per slot
+    std::vector<Pm4MutField> mutFields;      //!< copy of the template's mutable-field offsets
+  };
+  Pm4InplaceResident pm4Inplace_;
+  int pm4GraphInplaceState_ = -1;   //!< HIP_PM4_GRAPH_INPLACE env gate (in-place VRAM patch)
+  // Executable IB arena (HIP_PM4_GRAPH_PREWARM): one device-local executable
+  // buffer reserved once, with IBs sub-allocated from it via a first-fit free
+  // list. This both (a) warms the executable memory pool off the launch critical
+  // path -- the ~ms one-time first-allocation cost is paid at reservation, not on
+  // the first replay -- and (b) avoids a memory_pool_allocate/free round-trip per
+  // build/rebuild. An IB that does not fit falls back to a direct per-IB pool
+  // allocation (freed via memory_pool_free); arena-owned IBs are returned to the
+  // free list. Ownership is decided by address range (pm4ArenaOwns).
+  void* pm4Arena_ = nullptr;
+  size_t pm4ArenaBytes_ = 0;
+  std::vector<std::pair<size_t, size_t>> pm4ArenaFree_;  //!< sorted free spans (offset,bytes)
+  static constexpr size_t kPm4ArenaBytes = 8u * 1024u * 1024u;  //!< reserved exec arena size
+  bool pm4GraphActive();
+  bool pm4GraphScratchEnabled();
+  bool pm4GraphDeltaEnabled();      //!< skip SET_SH_REG writes whose value is unchanged
+  bool pm4GraphReorderEnabled();    //!< hoist next kernel's regs between release and acquire
+  bool pm4GraphKeyCacheEnabled();   //!< reuse last lookup when the packet array is unchanged
+  bool pm4GraphPrewarmEnabled();    //!< reserve the executable IB arena at init
+  bool pm4GraphBuildAfterEnabled(); //!< first replay goes AQL, PM4 IB built right after
+  bool pm4GraphSharedIbEnabled();   //!< build one device-scoped IB shared across streams
+  bool pm4GraphInheritScopeEnabled();//!< per-edge fence scope inherited from captured packet headers
+  bool pm4GraphProfileEnabled();     //!< per-kernel GPU-clock timestamps, gated on LOG_INFO+LOG_AQL logging
+  bool pm4TracingArmed();            //!< a kernel-dispatch profiler (legacy activity OR rocprofiler-sdk) is active
+  void reportPm4Timestamps(const Pm4GraphIb& g);  //!< read TS buffer, convert ticks, ClPrint per-kernel
+  bool pm4GraphInplaceEnabled();    //!< double-buffered in-place VRAM patch for scalar mutations
+  static uint64_t pm4GraphSkeletonKey(void* const* packets, size_t numPackets);  //!< structural hash
+  static uint32_t mutFieldValue(const Pm4MutField& mf, void* const* packets);    //!< current value
+  //! In-place fast path: handle this replay by patching/swapping the resident
+  //! double-buffered IB. Returns true if it submitted (caller is done); false to
+  //! fall through to the normal keycache/shared/rebuild path (not eligible: in-place
+  //! off, no template, scratch-deferred, or a structural/skeleton change).
+  bool tryReplayPm4GraphInplace(void* const* packets, size_t numPackets, bool blocking,
+                                bool attach_signal, uint64_t recordedPacketVersion,
+                                const Pm4GraphTemplate* tmpl);
+  //! Build the resident double-buffered IB for these packets (specialize host dwords,
+  //! allocate two device slots, upload both). Returns false on failure/deferred.
+  bool buildInplaceResident(void* const* packets, size_t numPackets,
+                            const Pm4GraphTemplate* tmpl, uint64_t skeletonKey);
+  //! Patch the mutable scalar dwords for the current packets into resident slot, then
+  //! SDMA the dirty span host->device. Caller must ensure the slot is not in flight.
+  void patchInplaceSlot(uint32_t slot, void* const* packets, size_t numPackets);
+  //! Release the resident double-buffered IB (both slots, staging, signals).
+  void freeInplaceResident();
+  void ensurePm4Arena();                          //!< reserve the executable IB arena (idempotent)
+  void* pm4ArenaAlloc(size_t bytes);              //!< slice from the arena, or nullptr if no fit
+  bool pm4ArenaOwns(const void* p) const;         //!< true if p lies within the arena
+  void pm4ArenaFreeBytes(void* p, size_t bytes);  //!< return a slice to the arena free list
+  void freePm4GraphIb(Pm4GraphIb& g);             //!< free g.ib (arena or pool) and null it
+  //! Stage data into an executable IB. deviceScoped=true forces a device-pool
+  //! allocation (skip the per-vdev arena) so the IB can outlive any single stream
+  //! (used for the GraphExec-owned shared IB); free with Hsa::memory_pool_free.
+  void* allocExecIbFromData(const uint32_t* data, uint32_t dw, bool deviceScoped = false);
+  static uint64_t pm4GraphKey(void* const* packets, size_t numPackets);  //!< content hash
+  //! Full build = encode (CPU) + specialize+upload, using THIS vdev's queue.
+  Pm4GraphIb buildPm4GraphIb(void* const* packets, size_t numPackets);
+  //! CPU-only encode of the packets into a queue-independent template (placeholders
+  //! for queue-dependent fields). Returns a heap-owned template (free with
+  //! freePm4GraphTemplate) or nullptr if encode is unsupported. Queue-independent,
+  //! so it can run at instantiate on any vdev of the graph's device.
+  void encodePm4GraphTemplate(void* const* packets, size_t numPackets, Pm4GraphTemplate& out);
+  //! Patch a template's placeholders from THIS vdev's queue, then alloc+upload the
+  //! IB. Returns kPm4DeferredScratch (queue scratch not sized yet), kPm4Ready, or
+  //! the template's terminal status. No CPU re-encode -- just patch + DMA.
+  //! deviceScoped=true allocates the IB from the device pool (for the shared IB).
+  Pm4GraphIb specializeFromTemplate(const Pm4GraphTemplate& t, bool deviceScoped = false);
+  //! Free oldest cached IBs (by insertion order) while pm4Graphs_ exceeds
+  //! kPm4MaxCachedIbs. Never frees the armed entry (pm4IbCacheEntry_) or the
+  //! protected entry just built/selected this launch.
+  void evictPm4GraphsIfNeeded(const Pm4GraphIb* protect);
+  //! Find the cached ready IB for these packets, or (if allowBuild) build+insert+
+  //! arm it. Returns the ready entry, or nullptr (cache miss with allowBuild=false,
+  //! or an unsupported/deferred build). Handles eviction and deferred-scratch.
+  //! tmpl (optional) is a capture-time encode: when present a cache miss
+  //! specializes from it (no CPU re-encode) instead of a full build.
+  Pm4GraphIb* findOrBuildPm4Graph(void* const* packets, size_t numPackets,
+                                  uint64_t recordedPacketVersion, bool allowBuild,
+                                  const Pm4GraphTemplate* tmpl);
+  //! Submit one compiled IB as a single vendor PM4-IB packet (ring write + doorbell).
+  //! outSig (optional) receives the completion signal the CP decrements after the IB
+  //! finishes, so the in-place path can guard a slot against being patched mid-flight.
+  void submitPm4Ib(const Pm4GraphIb& g, bool blocking, bool attach_signal,
+                   hsa_signal_t* outSig = nullptr);
+  //! Build + insert + arm the IB for these packets WITHOUT submitting. Used by
+  //! HIP_PM4_GRAPH_BUILD_AFTER after the AQL fallback submit has sized scratch.
+  void prebuildPm4Graph(void* const* packets, size_t numPackets, uint64_t recordedPacketVersion,
+                        const Pm4GraphTemplate* tmpl);
+  bool tryReplayPm4Graph(void* const* packets, size_t numPackets, bool blocking, bool attach_signal,
+                         uint64_t recordedPacketVersion, bool allowBuild = true,
+                         const Pm4GraphTemplate* tmpl = nullptr);
   void dispatchBarrierValuePacket(uint16_t packetHeader, bool resolveDepSignal = false,
                                   hsa_signal_t signal = hsa_signal_t{0},
                                   hsa_signal_value_t value = 0, hsa_signal_value_t mask = 0,
@@ -811,6 +1093,9 @@ class VirtualGPU : public device::VirtualDevice {
   uint64_t last_write_index_ = kInvalidQueueIndex; //!< The last HW queue write index for any packet
   uint64_t last_packet_with_signal_index_ = kInvalidQueueIndex; //!< The last HW queue write index for a packet
                                               //!< with a completion signal
+  void* pwsIbBuf_ = nullptr;                  //!< executable IB holding the PWS fence PM4
+  uint32_t pwsIbDw_ = 0;                      //!< dword count of the PWS PM4 IB (16 or 18)
+  int pwsFenceState_ = -1;                    //!< PWS fence env gate: -1 unknown, 0 off, 1 on
   hsa_signal_t last_completion_signal_{};     //!< The last completion signal
 
   //! SDMA engine affinity tracking for this VirtualGPU/stream

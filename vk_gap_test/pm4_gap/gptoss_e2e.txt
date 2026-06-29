@@ -1,0 +1,33 @@
+gpt-oss-20b end-to-end decode latency (flywheel direct mode)
+model: /huggingface/hub/models--openai--gpt-oss-20b-q0-lmhead-s0t/  (24 decoder layers, profile q0)
+shape: 512 input / 128 output tokens, concurrency 1, -n 5 requests/worker, greedy off
+env:   REDLINE_DEBUG_SKIP_SAMPLING=1  HIP_VISIBLE_DEVICES=0  (single gfx1100 / Radeon PRO W7900)
+note:  REDLINE_DEBUG_SKIP_SAMPLING feeds a host-selected random token and skips the sampling
+       chain -- output text is meaningless, this isolates the model+runtime perf path.
+
+bound runtimes verified distinct (hipRuntimeGetVersion):
+  ours build-gap : 70253211  (.../build-gap/hipamd/lib/libamdhip64.so.7.2.53211)
+  develop        : 71460850  (.../build-develop/hipamd/lib/libamdhip64.so.7.14.60850)
+  stock 7.2      : 70226015  (/opt/rocm-7.2.0/lib/libamdhip64.so.7.2.70200)
+
+columns: Concurrency  Throughput(req/s)  Latency(ms)  TTFT(ms)  TPOT(ms)  Tok/s  Tok/s/GPU  Tok/s/User
+
+B ours+PM4 (HIP_PM4_GRAPH=1)
+  rep1: 1   1.53   654.6    99.5   4.37   977.5   977.5   195.5
+  rep2: 1   1.52   656.0   100.3   4.38   975.3   975.3   195.1
+  rep3: 1   1.52   656.2   102.0   4.36   975.0   975.0   195.0
+
+C ours-AQL (HIP_PM4_GRAPH unset)
+  rep1: 1   1.39   718.8   100.5   4.87   890.2   890.2   178.0
+  rep2: 1   1.39   719.0   100.2   4.87   889.8   889.8   178.0
+  rep3: 1   1.39   719.4   101.1   4.87   889.4   889.4   177.9
+
+D stock 7.2
+  rep1: 1   1.39   719.8   100.8   4.87   888.9   888.9   177.8
+  rep2: 1   1.39   719.8   101.8   4.87   888.9   888.9   177.8
+  rep3: 1   1.39   719.7   101.5   4.87   889.0   889.0   177.8
+
+A develop
+  rep1: 1   1.39   720.9   101.4   4.88   887.5   887.5   177.5
+  rep2: 1   1.39   720.1   101.9   4.87   888.5   888.5   177.7
+  rep3: 1   1.38   722.9   103.0   4.88   885.1   885.1   177.0

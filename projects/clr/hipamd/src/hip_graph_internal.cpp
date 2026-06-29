@@ -1249,6 +1249,11 @@ hipError_t GraphExec::Init() {
 
     // For graph nodes capture AQL packets to dispatch them directly during graph launch.
     status = CaptureAQLPackets();
+    if (status == hipSuccess) {
+      // Encode the captured packets into PM4 templates now (instantiate) so the
+      // first replay pays only specialize+upload, not the O(N) CPU encode.
+      EncodePm4Templates();
+    }
   }
 
   static_cast<ReferenceCountedObject*>(hip::getCurrentDevice())->retain();
@@ -1399,6 +1404,10 @@ void GraphExec::PacketBatch::restorePatchListPointers(
 hipError_t GraphExec::CaptureAndFormPacketsForGraph() {
   // Fixme: Only single stream child graph nodes are supported.
   hipError_t status = hipSuccess;
+
+  // Recorded packet set is being (re)formed: invalidate the recorded packet set
+  // version so any cached PM4 IB is recompiled/relooked-up on the next launch.
+  InvalidateRecordedPacketVersion();
 
   // Clear previous batches
   segmentBatches_.clear();
@@ -1616,10 +1625,47 @@ hipError_t GraphExec::CaptureAQLPackets() {
 }
 
 // ================================================================================================
+void GraphExec::EncodePm4Templates() {
+  // Only single-device graphs replay through the flat batch dispatch path (where
+  // the template is consumed). develop captures into segmentBatches_ under segment
+  // scheduling, so iterate the per-segment packet batches.
+  if (max_streams_dev_.size() > 1) {
+    return;
+  }
+  hip::Device* dev = hip::getCurrentDevice();
+  // wait=false: we only need the vdev (queue-independent encode), not a sync point.
+  hip::Stream* nullStream = (dev != nullptr) ? dev->NullStream(false) : nullptr;
+  device::VirtualDevice* vdev = (nullStream != nullptr) ? nullStream->vdev() : nullptr;
+  if (vdev == nullptr) {
+    return;  // no vdev available yet -> first replay falls back to the full build
+  }
+  pm4TemplateVdev_ = vdev;
+  for (auto& segKv : segmentBatches_) {
+    for (auto& batch : segKv.second.packet_batches) {
+      if (batch.pm4Template != nullptr) {
+        vdev->freePm4GraphTemplate(batch.pm4Template);
+        batch.pm4Template = nullptr;
+      }
+      if (batch.dispatchPackets.empty()) {
+        continue;
+      }
+      // The template is keyed to these exact packet bytes; a later mutation simply
+      // produces a different key at launch and falls back to a full build (the stale
+      // template is ignored, never wrongly reused). Encode is queue-independent.
+      batch.pm4Template = vdev->buildPm4GraphTemplate(
+          reinterpret_cast<void* const*>(batch.dispatchPackets.data()),
+          batch.dispatchPackets.size());
+    }
+  }
+}
+
+// ================================================================================================
 hipError_t GraphExec::UpdateAQLPacket(hip::GraphNode* node) {
   if (!node->GraphCaptureEnabled()) {
     return hipSuccess;
   }
+  // A node's recorded packet is about to change -> invalidate the recorded packet set version.
+  InvalidateRecordedPacketVersion();
   // Todo: Add batching support for multi-device linear graph
   // Use node_to_segment_id_ for O(1) segment lookup
   auto segIdIt = node_to_segment_id_.find(node);
@@ -1788,6 +1834,9 @@ hipError_t GraphExec::UpdatePacketBatchesForNodeEnableDisable(hip::GraphNode* no
     // Only handle single stream case with captured nodes
     return hipSuccess;
   }
+  // The dispatched packet set changes (a node is enabled/disabled) -> invalidate
+  // the recorded packet set version so the cached IB is not reused for a different set.
+  InvalidateRecordedPacketVersion();
 
   // Use node_to_segment_id_ for O(1) segment lookup
   auto segIdIt = node_to_segment_id_.find(node);
@@ -2032,8 +2081,19 @@ hipError_t GraphExec::EnqueueSegment(const Segment& segment, hip::Stream* stream
     }
 
     if (!flatData->empty()) {
+      // PM4-IB graph-replay cache key: fold the recorded-packet-set version with
+      // this segment+batch identity so each batch gets a distinct, stable version
+      // (any graph mutation bumps the underlying mutation count). The capture-time
+      // template is only valid for the full, unfiltered packet set; when nodes are
+      // disabled the filtered set differs, so pass nullptr and let the replayer
+      // build/lookup by content hash.
+      const uint64_t pkt_version =
+          RecordedPacketVersion(static_cast<size_t>(segment.id) * 4096 + batchIndex);
+      const void* tmplForDispatch =
+          (packetBatch.disabledNodeCount == 0) ? packetBatch.pm4Template : nullptr;
       bool batchStatus = stream->vdev()->dispatchAqlPacketBatchFlat(
-          *flatData, *flatHdrs, accumulate, attach_signal, kernelNamesToDispatch, true);
+          *flatData, *flatHdrs, accumulate, attach_signal, kernelNamesToDispatch, true,
+          /*blocking=*/false, pkt_version, tmplForDispatch);
       if (!batchStatus) {
         return hipErrorUnknown;
       }

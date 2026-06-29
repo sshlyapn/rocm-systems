@@ -362,6 +362,11 @@ class Device : public NullDevice {
   //! Get the CPU agent with the least NUMA distance to this GPU
   const hsa_agent_t& getCpuAgent() const { return cpu_agent_info_->agent; }
 
+  //! Device-local (gpuvm) pool and a host fine-grained pool, for the
+  //! experimental PWS inter-kernel fence (executable PM4 IB allocation).
+  hsa_amd_memory_pool_t getGpuvmSegment() const { return gpuvm_segment_; }
+  hsa_amd_memory_pool_t getCpuFineGrainPool() const { return cpu_agent_info_->fine_grain_pool; }
+
   //! Get the CPU agent that is in a 'index' NUMA node
   const hsa_agent_t getCpuAgent(int index) const {
     if ((index < 0) || (index >= cpu_agents_.size())) {

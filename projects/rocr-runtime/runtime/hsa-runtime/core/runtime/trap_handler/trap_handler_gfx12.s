@@ -1295,7 +1295,7 @@
   s_bitset0_b32     ttmp6, TTMP6_SCC_SHIFT
 
 .if .amdgcn.gfx_generation_minor == 0
-  s_setreg_b32      hwreg(HW_REG_WAVE_SCHED_MODE, 0, 2), ttmp2
+  s_setreg_b32      hwreg(26, 0, 2), ttmp2
 .endif
 
   // Return to original (possibly modified) PC.

@@ -1,0 +1,10 @@
+# GPU=AMD Radeon AI PRO R9700 gcn=gfx1201 M=16384 HIP_PM4_GRAPH=1 HIP_PM4_GRAPH_SCRATCH=1
+multi       checksum=2142.686584
+nonmult     checksum=2129.860009
+coherence   checksum=2129.860009
+recreate    checksum=18546.625891
+lds         checksum=2306.333241
+wave64      checksum=10870.707956
+barriernode checksum=2129.860009
+varblk      checksum=2129.860009
+scratch     checksum=2129.859873

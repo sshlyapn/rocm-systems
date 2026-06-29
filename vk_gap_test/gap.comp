@@ -1,0 +1,28 @@
+#version 450
+
+// Tunable-duration compute kernel. Each invocation reads data[gid], spins for
+// `spin` iterations (dependent FMA chain so it is not optimized away), then
+// writes data[gid]. The read+write of the same location creates a RAW
+// dependency across consecutive dispatches, so a SHADER_WRITE->SHADER_READ
+// barrier between dispatches must perform real cache coherence work.
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) buffer Buf { float data[]; };
+
+layout(push_constant) uniform PC {
+    uint spin;
+    uint n;
+} pc;
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= pc.n) {
+        return;
+    }
+    float v = data[gid];
+    for (uint i = 0u; i < pc.spin; ++i) {
+        v = v * 1.0000001 + 1.0;
+    }
+    data[gid] = v;
+}

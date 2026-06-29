@@ -27,9 +27,13 @@ const char* BlitLinearSourceCode = BLIT_KERNELS(
 
     extern void __amd_streamOpsWrite(__global uint*, __global ulong*, ulong);
 
-    extern void __amd_streamOpsIncrement(__global uint*, __global ulong*, ulong);
+    void __amd_streamOpsIncrement(__global uint* pInt, __global ulong* pUlong, ulong value) {
+      if (pInt) { pInt[0] = pInt[0] + 1u; } else if (pUlong) { pUlong[0] = pUlong[0] + 1UL; }
+    }
 
-    extern void __amd_streamOpsDecrement(__global uint*, __global ulong*, ulong);
+    void __amd_streamOpsDecrement(__global uint* pInt, __global ulong* pUlong, ulong value) {
+      if (pInt) { pInt[0] = pInt[0] - 1u; } else if (pUlong) { pUlong[0] = pUlong[0] - 1UL; }
+    }
 
     extern void __amd_streamOpsWait(__global uint*, __global ulong*, ulong, ulong, ulong);
 

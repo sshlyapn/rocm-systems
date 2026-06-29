@@ -1,0 +1,31 @@
+##### (A) develop (AQL graph + develop graph opts: HW-signal pool, doorbell dedup) #####
+N=1    M=256    R=4000  instantiate=61.915 us  FIRST(cold,build+upload)=14.612 us  FIRST_e2e(launch+sync)=58.189 us  2nd(warm)=1.502 us || steady host hipGraphLaunch: avg=1.111 us  min=0.922 us  max=7.751 us  per-dispatch=1.1110 us
+N=4    M=256    R=4000  instantiate=70.268 us  FIRST(cold,build+upload)=16.235 us  FIRST_e2e(launch+sync)=60.643 us  2nd(warm)=1.462 us || steady host hipGraphLaunch: avg=1.378 us  min=0.941 us  max=26.501 us  per-dispatch=0.3444 us
+N=16   M=256    R=4000  instantiate=79.331 us  FIRST(cold,build+upload)=15.714 us  FIRST_e2e(launch+sync)=109.758 us  2nd(warm)=2.834 us || steady host hipGraphLaunch: avg=1.198 us  min=0.941 us  max=6.410 us  per-dispatch=0.0749 us
+N=64   M=256    R=4000  instantiate=117.249 us  FIRST(cold,build+upload)=16.235 us  FIRST_e2e(launch+sync)=222.000 us  2nd(warm)=2.944 us || steady host hipGraphLaunch: avg=1.416 us  min=1.121 us  max=5.659 us  per-dispatch=0.0221 us
+N=128  M=256    R=4000  instantiate=182.048 us  FIRST(cold,build+upload)=17.487 us  FIRST_e2e(launch+sync)=790.048 us  2nd(warm)=3.095 us || steady host hipGraphLaunch: avg=1.386 us  min=1.231 us  max=5.629 us  per-dispatch=0.0108 us
+N=256  M=256    R=4000  instantiate=295.452 us  FIRST(cold,build+upload)=15.623 us  FIRST_e2e(launch+sync)=1689.554 us  2nd(warm)=2.724 us || steady host hipGraphLaunch: avg=1.633 us  min=1.382 us  max=5.618 us  per-dispatch=0.0064 us
+
+##### (B) ours + PM4 graph (HIP_PM4_GRAPH=1; template+sharedIB default on) #####
+N=1    M=256    R=4000  instantiate=4141.684 us  FIRST(cold,build+upload)=30.557 us  FIRST_e2e(launch+sync)=102.587 us  2nd(warm)=5.469 us || steady host hipGraphLaunch: avg=3.500 us  min=2.074 us  max=33.441 us  per-dispatch=3.4996 us
+N=4    M=256    R=4000  instantiate=3796.396 us  FIRST(cold,build+upload)=19.280 us  FIRST_e2e(launch+sync)=76.527 us  2nd(warm)=3.786 us || steady host hipGraphLaunch: avg=2.976 us  min=2.023 us  max=37.818 us  per-dispatch=0.7439 us
+N=16   M=256    R=4000  instantiate=4108.153 us  FIRST(cold,build+upload)=21.063 us  FIRST_e2e(launch+sync)=95.917 us  2nd(warm)=5.398 us || steady host hipGraphLaunch: avg=3.744 us  min=2.103 us  max=12.049 us  per-dispatch=0.2340 us
+N=64   M=256    R=4000  instantiate=4934.797 us  FIRST(cold,build+upload)=22.604 us  FIRST_e2e(launch+sync)=170.000 us  2nd(warm)=4.747 us || steady host hipGraphLaunch: avg=2.747 us  min=1.993 us  max=35.414 us  per-dispatch=0.0429 us
+N=128  M=256    R=4000  instantiate=5905.942 us  FIRST(cold,build+upload)=23.687 us  FIRST_e2e(launch+sync)=266.408 us  2nd(warm)=5.118 us || steady host hipGraphLaunch: avg=2.977 us  min=2.013 us  max=59.030 us  per-dispatch=0.0233 us
+N=256  M=256    R=4000  instantiate=7499.209 us  FIRST(cold,build+upload)=37.397 us  FIRST_e2e(launch+sync)=472.032 us  2nd(warm)=5.688 us || steady host hipGraphLaunch: avg=2.732 us  min=2.103 us  max=38.519 us  per-dispatch=0.0107 us
+
+##### (C) ours AQL (our lib, HIP_PM4_GRAPH unset) #####
+N=1    M=256    R=4000  instantiate=52.541 us  FIRST(cold,build+upload)=16.725 us  FIRST_e2e(launch+sync)=68.104 us  2nd(warm)=5.248 us || steady host hipGraphLaunch: avg=3.042 us  min=1.983 us  max=126.043 us  per-dispatch=3.0416 us
+N=4    M=256    R=4000  instantiate=60.203 us  FIRST(cold,build+upload)=18.177 us  FIRST_e2e(launch+sync)=95.596 us  2nd(warm)=6.319 us || steady host hipGraphLaunch: avg=3.024 us  min=2.464 us  max=26.130 us  per-dispatch=0.7561 us
+N=16   M=256    R=4000  instantiate=95.616 us  FIRST(cold,build+upload)=20.942 us  FIRST_e2e(launch+sync)=158.633 us  2nd(warm)=5.458 us || steady host hipGraphLaunch: avg=3.369 us  min=2.914 us  max=13.160 us  per-dispatch=0.2105 us
+N=64   M=256    R=4000  instantiate=101.756 us  FIRST(cold,build+upload)=19.710 us  FIRST_e2e(launch+sync)=431.390 us  2nd(warm)=14.021 us || steady host hipGraphLaunch: avg=3.832 us  min=3.385 us  max=17.687 us  per-dispatch=0.0599 us
+N=128  M=256    R=4000  instantiate=148.998 us  FIRST(cold,build+upload)=18.748 us  FIRST_e2e(launch+sync)=790.008 us  2nd(warm)=8.343 us || steady host hipGraphLaunch: avg=4.272 us  min=3.796 us  max=15.213 us  per-dispatch=0.0334 us
+N=256  M=256    R=4000  instantiate=247.218 us  FIRST(cold,build+upload)=19.930 us  FIRST_e2e(launch+sync)=1503.178 us  2nd(warm)=6.661 us || steady host hipGraphLaunch: avg=5.080 us  min=4.527 us  max=15.784 us  per-dispatch=0.0198 us
+
+##### (D) stock ROCm 7.2 (/opt/rocm AQL) #####
+N=1    M=256    R=4000  instantiate=45.500 us  FIRST(cold,build+upload)=14.802 us  FIRST_e2e(launch+sync)=67.944 us  2nd(warm)=4.487 us || steady host hipGraphLaunch: avg=3.447 us  min=1.913 us  max=13.019 us  per-dispatch=3.4474 us
+N=4    M=256    R=4000  instantiate=51.599 us  FIRST(cold,build+upload)=18.678 us  FIRST_e2e(launch+sync)=92.882 us  2nd(warm)=7.091 us || steady host hipGraphLaunch: avg=2.840 us  min=2.303 us  max=13.430 us  per-dispatch=0.7099 us
+N=16   M=256    R=4000  instantiate=62.456 us  FIRST(cold,build+upload)=19.530 us  FIRST_e2e(launch+sync)=157.661 us  2nd(warm)=5.759 us || steady host hipGraphLaunch: avg=3.438 us  min=2.784 us  max=12.409 us  per-dispatch=0.2149 us
+N=64   M=256    R=4000  instantiate=98.110 us  FIRST(cold,build+upload)=17.988 us  FIRST_e2e(launch+sync)=427.394 us  2nd(warm)=5.518 us || steady host hipGraphLaunch: avg=4.109 us  min=3.355 us  max=15.945 us  per-dispatch=0.0642 us
+N=128  M=256    R=4000  instantiate=151.872 us  FIRST(cold,build+upload)=17.427 us  FIRST_e2e(launch+sync)=789.878 us  2nd(warm)=6.240 us || steady host hipGraphLaunch: avg=4.277 us  min=3.656 us  max=44.398 us  per-dispatch=0.0334 us
+N=256  M=256    R=4000  instantiate=278.065 us  FIRST(cold,build+upload)=21.894 us  FIRST_e2e(launch+sync)=1701.673 us  2nd(warm)=6.750 us || steady host hipGraphLaunch: avg=5.222 us  min=4.407 us  max=42.325 us  per-dispatch=0.0204 us

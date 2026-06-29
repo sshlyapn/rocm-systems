@@ -1365,15 +1365,29 @@ class VirtualDevice : public amd::ReferenceCountedObject {
   virtual void HiddenHeapInit() = 0;
 
   //! Fast-path dispatch using a pre-built contiguous flat packet buffer.
+  //! recordedPacketVersion is a reliable version stamp for the recorded packet set
+  //! (nonzero, stable iff the packets are unchanged, bumped on any graph update);
+  //! 0 means "unknown / do not cache". pm4Template is an optional capture-time PM4
+  //! template (see buildPm4GraphTemplate) consumed by the PM4-IB graph-replay path.
   virtual bool dispatchAqlPacketBatchFlat(const std::vector<uint8_t>& flatPacketData,
                                           const std::vector<uint32_t>& validFullHeaders,
                                           amd::AccumulateCommand* vcmd = nullptr,
                                           bool attach_signal = false,
                                           const std::vector<const std::string*>* kernelNames = nullptr,
                                           bool pre_patched = false,
-                                          bool blocking = false) {
+                                          bool blocking = false,
+                                          uint64_t recordedPacketVersion = 0,
+                                          const void* pm4Template = nullptr) {
     return false;
   }
+  //! Encode a captured graph into a heap-owned, opaque PM4 template at instantiate
+  //! time (CPU-only, queue-independent) so the per-launch build is just a cheap
+  //! specialize+upload. Returns nullptr when the backend has no PM4 replay path.
+  //! The returned handle is passed back as dispatchAqlPacketBatchFlat's pm4Template
+  //! and must be released with freePm4GraphTemplate.
+  virtual void* buildPm4GraphTemplate(void* const* packets, size_t numPackets) { return nullptr; }
+  //! Free a template returned by buildPm4GraphTemplate (no-op for nullptr).
+  virtual void freePm4GraphTemplate(void* tmpl) {}
 
   //! Returns the number of outstanding HSA async handlers
   std::atomic<uint64_t>& QueuedAsyncHandlers() const { return queued_async_handlers_; }

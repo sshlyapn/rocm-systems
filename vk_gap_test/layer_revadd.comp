@@ -1,0 +1,14 @@
+#version 450
+// Reverse-read mix: dst[i] = 0.5*dst[i] + 0.5*src[n-1-i]. Matches HIP/PM4
+// k_revadd(dst,src). Thread i reads src at the MIRRORED index n-1-i (written by
+// a different workgroup in the previous dispatch) -> stresses the inter-dispatch
+// cache invalidate. dst (binding 0) and src (binding 1) ping-pong between X and Y
+// across dispatches via two descriptor sets.
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) buffer Dst { float dst[]; };
+layout(std430, binding = 1) readonly buffer Src { float src[]; };
+layout(push_constant) uniform PC { uint n; } pc;
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i < pc.n) dst[i] = 0.5 * dst[i] + 0.5 * src[pc.n - 1u - i];
+}
